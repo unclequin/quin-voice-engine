@@ -4,6 +4,7 @@ import re
 import io
 import hashlib
 import argparse
+import numpy as np
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -95,13 +96,52 @@ def generate_silence(duration_seconds=0.6, rate=24000, sample_width=2, channels=
     """
     return b'\x00' * int(rate * sample_width * channels * duration_seconds)
 
+def extract_clean_pcm(raw_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """
+    Extracts pure 16-bit mono PCM audio from Gemini TTS output.
+    Strips RIFF WAVE headers and trailing metadata chunks (such as C2PA/SynthID
+    in gemini-3.8-flash-tts) that otherwise play as a burst of static/hiss at
+    the end of each speaker turn. Also applies a 15ms fade-in/fade-out.
+    """
+    if raw_bytes.startswith(b"RIFF"):
+        with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
+            pcm_bytes = wf.readframes(wf.getnframes())
+    else:
+        pcm_bytes = raw_bytes
+
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
+
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    if len(samples) == 0:
+        return pcm_bytes
+
+    fade_len = min(int(0.015 * sample_rate), len(samples) // 4)
+    if fade_len > 0:
+        samples[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        samples[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+
+    return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
+
+def is_likely_repeated(pcm_bytes: bytes, text: str, sample_rate: int = 24000, min_cps: float = 11.2) -> tuple[bool, float, float]:
+    """
+    Detects whether a generated TTS turn likely repeated a sentence by checking
+    the speaking rate (characters per second). Normal Thai podcast speech on
+    Gemini TTS is ~12.0-15.5 chars/s; repeated sentences drop below ~11.2 chars/s.
+    """
+    duration = (len(pcm_bytes) / 2) / sample_rate
+    if duration <= 0 or len(text) < 80:
+        return False, duration, (len(text) / duration if duration > 0 else 0.0)
+    cps = len(text) / duration
+    return cps < min_cps, duration, cps
+
 def main():
     parser = argparse.ArgumentParser(description="🎙️ Thai 2-Person Podcast Audio Generator")
     parser.add_argument("--input", "-i", default="input.txt", help="Path to input transcript file (default: input.txt)")
     parser.add_argument("--output", "-o", default="output.wav", help="Path to output WAV file (default: output.wav)")
     parser.add_argument("--no-cache", action="store_true", help="Disable cache and force regeneration")
     parser.add_argument("--clear-cache", action="store_true", help="Clear the cache directory and exit")
-    parser.add_argument("--model", "-m", default="gemini-3.1-flash-tts-preview", help="Gemini TTS model name (default: gemini-3.1-flash-tts-preview)")
+    parser.add_argument("--model", "-m", default="gemini-3.8-flash-tts", help="Gemini TTS model name (default: gemini-3.1-flash-tts-preview)")
     parser.add_argument("--file-style", action="store_true", help="Use style from input.txt instead of conversational style")
     args = parser.parse_args()
 
@@ -135,7 +175,7 @@ def main():
             },
             "Speaker 2": {
                 "voice": "Charon",
-                "style": "Style: Casual podcast conversation, wise, warm, mature male co-host (uncle figure), natural Thai speech, natural conversational pacing, clear articulation, realistic pauses."
+                "style": "Style: Casual podcast conversation, seasoned 40+ year old male host (mid-40s uncle figure), deep and resonant baritone voice, calm, wise, warm, composed demeanor, steady and measured pacing, natural Thai speech, clear articulation, realistic pauses."
             }
         }
 
@@ -158,8 +198,11 @@ def main():
             voice_name = config["voice"]
             style_brief = style_context if (args.file_style and style_context) else config["style"]
             
-            # Combine brief and text
-            full_prompt = f"[{style_brief}]. Read the following text naturally: {clean_text}"
+            # Combine brief and text with explicit anti-repetition directive
+            full_prompt = (
+                f"[{style_brief}]. Read the following text naturally and verbatim "
+                f"exactly once from start to finish, without repeating any words or phrases: {clean_text}"
+            )
 
             print(f"🎙️ [{idx + 1}/{len(dialogue)}] Speaker: {speaker} | Voice: {voice_name}")
             print(f"   Original: {text[:60]}...")
@@ -173,32 +216,47 @@ def main():
 
             pcm_bytes = None
             if not args.no_cache and os.path.exists(cache_file):
-                print("   ⚡ [Cache Hit]")
                 with open(cache_file, "rb") as f:
-                    pcm_bytes = f.read()
-            else:
-                print("   🌐 [Cache Miss] Generating audio via Gemini API...")
-                response = client.models.generate_content(
-                    model=args.model,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["AUDIO"],
-                        speech_config=types.SpeechConfig(
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
-                            )
-                        ),
+                    cached_raw = f.read()
+                candidate_pcm = extract_clean_pcm(cached_raw)
+                repeated, dur, cps = is_likely_repeated(candidate_pcm, clean_text)
+                if repeated:
+                    print(f"   ⚠️ [Cache Invalidated] Detected likely sentence repetition in cache ({dur:.1f}s, {cps:.1f} chars/s). Regenerating...")
+                else:
+                    print(f"   ⚡ [Cache Hit] ({dur:.1f}s, {cps:.1f} chars/s)")
+                    pcm_bytes = candidate_pcm
+
+            if pcm_bytes is None:
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    print(f"   🌐 [Cache Miss] Generating audio via Gemini API (attempt {attempt}/{max_attempts})...")
+                    response = client.models.generate_content(
+                        model=args.model,
+                        contents=full_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                                )
+                            ),
+                        )
                     )
-                )
 
-                if not response.candidates or not response.candidates[0].content.parts:
-                    raise ValueError(f"Failed to generate audio for line {idx + 1}")
+                    if not response.candidates or not response.candidates[0].content.parts:
+                        raise ValueError(f"Failed to generate audio for line {idx + 1}")
 
-                part = response.candidates[0].content.parts[0]
-                pcm_bytes = part.inline_data.data
+                    part = response.candidates[0].content.parts[0]
+                    pcm_bytes = extract_clean_pcm(part.inline_data.data)
+                    repeated, dur, cps = is_likely_repeated(pcm_bytes, clean_text)
+                    if repeated and attempt < max_attempts:
+                        print(f"   ⚠️ Detected likely repeated phrase ({dur:.1f}s, {cps:.1f} chars/s). Retrying...")
+                        continue
+                    print(f"   ✅ Generated clean audio ({dur:.1f}s, {cps:.1f} chars/s)")
+                    break
 
-                # Save to cache
-                if not args.no_cache:
+                # Save clean PCM to cache
+                if not args.no_cache and pcm_bytes is not None:
                     os.makedirs(".cache", exist_ok=True)
                     with open(cache_file, "wb") as f:
                         f.write(pcm_bytes)
